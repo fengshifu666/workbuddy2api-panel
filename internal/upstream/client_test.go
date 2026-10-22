@@ -36,6 +36,11 @@ func TestClassify(t *testing.T) {
 		// 只看文案会把健康账号误禁用，只按 code 会把 11140 的限流变体误判。
 		{400, `{"code":"11-128","msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, ErrChannelRefused},
 		{403, `{"code":"11-128","msg":"request illegal"}`, ErrChannelRefused},
+		{400, `{"code":"11-128","msg":"conversation id missing"}`, ErrChannelRefused},
+		{400, `{"code":"11-128","msg":"first message is not system prompt"}`, ErrChannelRefused},
+		{400, `{"code":"11-128","msg":"Illegal API invocation from an unapproved channel"}`, ErrChannelRefused},
+		{400, `{"code":11140,"msg":"Your account has been restricted due to unusual activity"}`, ErrAccountFault},
+		{403, `{"code":11140,"msg":"账号存在异常行为，已被限制使用"}`, ErrAccountFault},
 		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		// 无 code 的裸 "request illegal" 不归属任何账号级判定（宁可走通用 4xx 兜底，

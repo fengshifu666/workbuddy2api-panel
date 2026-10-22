@@ -123,6 +123,8 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// policy 上游通道/账号策略防护：跨请求熔断，防止持续请求把整池账号拖入限制。
+	policy policyGuard
 }
 
 // NewHandler 构建 handler。
@@ -601,6 +603,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
+	if guard := h.policy.blockedAt(realm, time.Now()); guard.Blocked {
+		msg := fmt.Sprintf("%s upstream policy guard is active until %s", realm, guard.Until.Format(time.RFC3339))
+		hint := "gateway paused requests to this realm after repeated upstream policy rejections; retry after the guard expires"
+		if guard.Reason != "" {
+			hint += "; reason: " + guard.Reason
+		}
+		writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_policy_guard", msg, hint)
+		st.status = http.StatusServiceUnavailable
+		st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
+
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
 	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
@@ -945,6 +959,46 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			}
+			// 通道校验失败是请求形态问题，不是账号问题。同一个 body 换账号仍会
+			// 撞同一道校验；逐号轮换只会把一次错误放大成 MaxRotate 次请求。
+			if kind == upstream.ErrChannelRefused {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				h.policy.noteChannelRefusedAt(realm, time.Now())
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream rejected the request channel; the request did not match an accepted client shape"
+				}
+				outStatus := status
+				if outStatus < http.StatusBadRequest || outStatus > 499 {
+					outStatus = http.StatusBadRequest
+				}
+				writeOpenAIErrorHint(w, outStatus, "channel_refused", msg,
+					h.hintOf(upstream.ErrChannelRefused, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = outStatus
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
+			// 11140 账号限制后继续轮换会把一次异常请求扩散到整池账号。
+			// 当前账号按既有策略禁用，但本轮立即停止，不再碰其他账号。
+			if kind == upstream.ErrAccountFault && upstream.IsAccountRestricted(string(respBody)) {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				h.policy.noteAccountRestrictedAt(realm, acct.UID, time.Now())
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "account restricted by upstream due to unusual activity"
+				}
+				outStatus := status
+				if outStatus < http.StatusBadRequest || outStatus > 499 {
+					outStatus = http.StatusForbidden
+				}
+				writeOpenAIErrorHint(w, outStatus, "account_restricted", msg,
+					h.hintOf(upstream.ErrAccountFault, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = outStatus
+				st.outcome = reqlog.OutcomeHTTPError
+				return
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append

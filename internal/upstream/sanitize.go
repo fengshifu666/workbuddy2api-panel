@@ -17,9 +17,12 @@ var sanitizeFeatures = []string{
 	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
 	"You are Claude Code",        // 身份句（截断前缀即可命中）
 	"Main branch (",              // 注入指令句（截断前缀即可命中）
-	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
-	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
-	"11128",                                           // 上游反探测：裸数字错误码
+	"You are a coding agent running in the Codex CLI",                 // Codex instructions 首段（截断前缀即可命中）
+	"You are an AI agent powered by DeepSeek Harness",                 // DSH 固定身份句
+	"You are a coding agent powered by the deepseek-v4.1-flash model", // DSH 模型身份变体
+	"You are an AI assistant built on DeepSeek",                       // DSH 品牌变体
+	"github.com/anthropics/",                                          // 反馈句里的 Anthropic 仓库链接
+	"11128",                                                           // 上游反探测：裸数字错误码
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -59,6 +62,18 @@ var sanitizeRewrites = [][2]string{
 	{
 		"You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
 		"You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+	},
+	{
+		"You are an AI agent powered by DeepSeek Harness.",
+		"You are a helpful AI assistant.",
+	},
+	{
+		"You are a coding agent powered by the deepseek-v4.1-flash model.",
+		"You are a helpful AI assistant.",
+	},
+	{
+		"You are an AI assistant built on DeepSeek.",
+		"You are a helpful AI assistant.",
 	},
 	{
 		// 反馈句：整句带 Anthropic 仓库链接，上游按整句拦截（只留链接或只留半边均不拦，

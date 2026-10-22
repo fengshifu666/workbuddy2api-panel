@@ -157,28 +157,62 @@ var accountFaultMarkers = []string{
 	"trial version is not yet activated",
 }
 
-// accountRestrictedMsg 是 WorkBuddy 11140 账号限制的正文关键词。
-const accountRestrictedMsg = "request illegal"
+// accountRestrictedMarkers 是 WorkBuddy 11140 账号限制的正文关键词。
+// 上游会随策略切换文案，除 "request illegal" 外还会直接说账号因异常行为被限制。
+var accountRestrictedMarkers = []string{
+	"request illegal",
+	"account has been restricted",
+	"account restricted",
+	"unusual activity",
+	"账号存在异常行为",
+	"账号已被限制",
+	"帳號存在異常行為",
+	"帳號已被限制",
+}
 
-// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制（11140
-// "request illegal"）。必须 code + 文案双条件：
+// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制（11140）。
+// 必须 code + 文案双条件：
 //   - 只看文案："request illegal" 也出现在 11128 通道校验失败里（健康账号）；
 //   - 只看 code：11140 也承载模型级限流文案（应归 ErrSoftRate）。
 func IsAccountRestricted(body string) bool {
-	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+	if !hasBusinessCode(body, "11140") {
 		return false
 	}
-	return hasBusinessCode(body, "11140")
+	lower := strings.ToLower(body)
+	for _, marker := range accountRestrictedMarkers {
+		if strings.Contains(lower, strings.ToLower(marker)) || strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128
 // "request illegal"）。11128 还承载内容审核变体（"blocked by security policy"，
 // 归 ErrContentBlocked），故必须 code + 文案双条件，不能按 code 一刀切。
+var channelRefusedMarkers = []string{
+	"request illegal",
+	"conversation id missing",
+	"first message is not system prompt",
+	"illegal api invocation from an unapproved channel",
+	"illegal api invocation",
+	"unapproved channel",
+	"channel verification",
+	"这次调用没通过渠道校验",
+	"本次呼叫未通過通路驗證",
+}
+
 func isChannelRefused(body string) bool {
-	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+	if !hasBusinessCode(body, "11-128") {
 		return false
 	}
-	return hasBusinessCode(body, "11-128")
+	lower := strings.ToLower(body)
+	for _, marker := range channelRefusedMarkers {
+		if strings.Contains(lower, strings.ToLower(marker)) || strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -1204,18 +1238,16 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // respBody 自行兜底。
 //
 // global chat 自 #119 实测后固定走 /v2（chat 层无 fallback 链；billing 层的 404
-// fallback 独立存在，语义不受影响）。ensureConsoleSystem 在 prepareBody 后统一套用
-// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
-// #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
-// 反证，删了无回滚路径）。
+// fallback 独立存在，语义不受影响）。ensureConsoleSystem 在 prepareBody 后统一套用：
+// CN/global 首条消息非 system 时都前置兜底 system（防上游 code 11-128）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
-	if c.globalOn(a) {
-		prepared = ensureConsoleSystem(prepared)
-	}
+	// 所有 realm 都补齐首条 system：上游对“首条不是 system”的检查会以 11-128
+	// 返回，CN/global 共用同一条消息形态约束。
+	prepared = ensureConsoleSystem(prepared)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。

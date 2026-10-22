@@ -42,6 +42,31 @@ func TestIdentityDesktopVariantRewritten(t *testing.T) {
 	}
 }
 
+// 2026-10-21 实测：DSH 的固定身份句会被上游渠道校验按逐字特征拦截，返回
+// 11-128 / Illegal API invocation from an unapproved channel。改一词即可通过。
+func TestDSHIdentityRewritten(t *testing.T) {
+	in := "You are an AI agent powered by DeepSeek Harness."
+	out := sanitizeText(in)
+	if out == in || strings.Contains(out, "You are an AI agent") {
+		t.Fatalf("DSH identity not rewritten: %q", out)
+	}
+	if !strings.Contains(out, "You are a helpful AI assistant.") {
+		t.Errorf("rewrite should preserve meaning: %q", out)
+	}
+}
+
+func TestDSHIdentityVariantsRewritten(t *testing.T) {
+	for _, in := range []string{
+		"You are a coding agent powered by the deepseek-v4.1-flash model.",
+		"You are an AI assistant built on DeepSeek.",
+	} {
+		out := sanitizeText(in)
+		if out != "You are a helpful AI assistant." {
+			t.Errorf("sanitizeText(%q) = %q", in, out)
+		}
+	}
+}
+
 func TestBranchRewritten(t *testing.T) {
 	out := sanitizeText(ccBranch)
 	if !strings.Contains(out, "Default branch (you will usually use this for PRs)") {

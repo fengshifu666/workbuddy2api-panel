@@ -343,9 +343,9 @@ func dropReasoningContentParts(obj map[string]any) {
 	obj["messages"] = out
 }
 
-// ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
+// ensureConsoleSystem 出站兜底 system 注入（吸收 PR #45，防上游 code 11-128）：
 // 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
-// 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
+// CN/global 统一调用；即使首条就是 system 也不重复注入。
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
 func ensureConsoleSystem(body []byte) []byte {
 	if len(body) == 0 {

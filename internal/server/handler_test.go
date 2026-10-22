@@ -210,6 +210,147 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
+// TestChatChannelRefusedFailsFastWithoutPenalty 11-128 是请求通道校验失败。
+// 同一 body 换账号仍会撞同一道校验，因此只允许打一次上游；账号本身不得被禁用、
+// 冷却或累计错误，响应需明确 channel_refused 并保留上游原文。
+func TestChatChannelRefusedFailsFastWithoutPenalty(t *testing.T) {
+	calls := map[string]int{}
+	const upstreamBody = `{"code":"11-128","msg":"Illegal API invocation from an unapproved channel","requestId":"channel-1","displayTips":{"en":"This call failed channel verification."}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, upstreamBody, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400 channel_refused)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 0 {
+		t.Errorf("calls=%v want bad 1 次、good 0 次（零轮转）", calls)
+	}
+	st, _ := p.Status("bad")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("channel refusal must not penalize account: %+v", st)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "channel_refused") || !strings.Contains(body, "11-128") {
+		t.Errorf("response should expose channel_refused and upstream body: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") {
+		t.Errorf("channel failure must not be reported as account exhaustion: %s", body)
+	}
+}
+
+// TestChatAccountRestrictedStopsRotation 11140 账号限制后继续使用其他账号，
+// 会把同一异常请求扩散到整个池。断言第一个账号被禁用、后续账号不再被调用。
+func TestChatAccountRestrictedStopsRotation(t *testing.T) {
+	calls := map[string]int{}
+	const upstreamBody = `{"code":11140,"msg":"Your account has been restricted due to unusual activity","requestId":"restricted-1"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 403, upstreamBody, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "first", AccessToken: "at-first", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "second", AccessToken: "at-second", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("first", 2000, 0)
+	p.SetCredits("second", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%s (want 403 account_restricted)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-first"] != 1 || calls["Bearer at-second"] != 0 {
+		t.Errorf("calls=%v want first 1 次、second 0 次（账号限制后停止轮转）", calls)
+	}
+	first, _ := p.Status("first")
+	second, _ := p.Status("second")
+	if !first.Disabled {
+		t.Errorf("restricted account should be disabled: %+v", first)
+	}
+	if second.Disabled {
+		t.Errorf("second account must remain untouched: %+v", second)
+	}
+	if !strings.Contains(rec.Body.String(), "account_restricted") {
+		t.Errorf("response should expose account_restricted: %s", rec.Body.String())
+	}
+}
+
+func TestChatAccountRestrictionGuardStopsPoolCascade(t *testing.T) {
+	calls := map[string]int{}
+	const upstreamBody = `{"code":11140,"msg":"Your account has been restricted due to unusual activity","requestId":"restricted-guard"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 403, upstreamBody, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "first", AccessToken: "at-first", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "second", AccessToken: "at-second", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "third", AccessToken: "at-third", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("first", 3000, 0)
+	p.SetCredits("second", 2000, 0)
+	p.SetCredits("third", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	body := `{"model":"glm-5.2","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("request %d code=%d body=%s", i+1, rec.Code, rec.Body)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("third request code=%d body=%s (want guard 503)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-first"] != 1 || calls["Bearer at-second"] != 1 || calls["Bearer at-third"] != 0 {
+		t.Errorf("calls=%v want first=1 second=1 third=0", calls)
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_policy_guard") {
+		t.Errorf("response should expose policy guard: %s", rec.Body.String())
+	}
+}
+
+func TestChatChannelGuardStopsRepeatedProbe(t *testing.T) {
+	calls := 0
+	const upstreamBody = `{"code":"11-128","msg":"Illegal API invocation from an unapproved channel","requestId":"channel-guard"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, upstreamBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	body := `{"model":"glm-5.2","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`
+	for i := 0; i < policyChannelThreshold; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("request %d code=%d body=%s", i+1, rec.Code, rec.Body)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("guarded request code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls != policyChannelThreshold {
+		t.Errorf("upstream calls=%d want %d", calls, policyChannelThreshold)
+	}
+}
+
 // TestChatBadParams400CarriesUpstreamBody 11101 的 400 响应必须包含上游原始
 // 11101 信息（含 requestId，客户端据此排查），且不再出现空洞的 no_healthy_account。
 func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
